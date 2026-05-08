@@ -70,4 +70,54 @@ describe('Kiro CodeWhisperer request conversion', () => {
             process.exit(0);
         `], { cwd: process.cwd(), stdio: 'pipe' });
     });
+
+    test('shortens Kiro tool names and restores response tool calls', async () => {
+        execFileSync(process.execPath, ['--input-type=module', '-e', `
+            import { KiroApiService } from './src/providers/claude/claude-kiro.js';
+
+            const service = new KiroApiService();
+            const longToolName = 'mcp__claude_ai_Cloudflare_Developer_Platform__hyperdrive_config_delete';
+            const request = await service.buildCodewhispererRequest(
+                [
+                    { role: 'user', content: 'first' },
+                    {
+                        role: 'assistant',
+                        content: [
+                            { type: 'tool_use', id: 'toolu_1', name: longToolName, input: { hyperdrive_id: 'abc' } }
+                        ]
+                    },
+                    { role: 'user', content: 'continue' }
+                ],
+                'claude-opus-4-7',
+                [{
+                    name: longToolName,
+                    description: 'Delete a Hyperdrive configuration',
+                    input_schema: {
+                        type: 'object',
+                        additionalProperties: false,
+                        properties: { hyperdrive_id: { type: 'string' } },
+                        required: ['hyperdrive_id']
+                    }
+                }]
+            );
+
+            const toolSpec = request.conversationState.currentMessage.userInputMessage.userInputMessageContext.tools[0].toolSpecification;
+            if (toolSpec.name.length > 64 || toolSpec.name === longToolName) {
+                throw new Error('long tool name was not shortened for Kiro');
+            }
+
+            const assistantTool = request.conversationState.history[1].assistantResponseMessage.toolUses[0];
+            if (assistantTool.name !== toolSpec.name) {
+                throw new Error('assistant history tool_use was not mapped to the Kiro tool name');
+            }
+
+            const rawEvent = ':message-typeevent{"name":"' + toolSpec.name + '","toolUseId":"toolu_2","input":"{}","stop":true}';
+            const parsed = service.parseEventStreamChunk(rawEvent, request._kiroToolNameMaps);
+            if (parsed.toolCalls[0].function.name !== longToolName) {
+                throw new Error('Kiro tool name was not restored for Claude response');
+            }
+
+            process.exit(0);
+        `], { cwd: process.cwd(), stdio: 'pipe' });
+    });
 });

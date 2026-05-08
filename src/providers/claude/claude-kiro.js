@@ -48,6 +48,92 @@ const KIRO_CONSTANTS = {
     TOTAL_CONTEXT_TOKENS: 200000, // Claude Sonnet 4.5 actual context is 200K
 };
 
+const KIRO_MAX_TOOL_NAME_LENGTH = 64;
+let kiroThrottleQueue = Promise.resolve();
+let kiroLastRequestStartedAt = 0;
+
+function shortenKiroToolName(name) {
+    const rawName = String(name || '');
+    if (rawName.length <= KIRO_MAX_TOOL_NAME_LENGTH) {
+        return rawName;
+    }
+
+    const hash = crypto.createHash('sha256').update(rawName).digest('hex').slice(0, 12);
+    const prefixLength = KIRO_MAX_TOOL_NAME_LENGTH - hash.length - 1;
+    return `${rawName.slice(0, prefixLength)}_${hash}`;
+}
+
+function buildKiroToolNameMaps(tools) {
+    const aliasToOriginal = new Map();
+    const originalToAlias = new Map();
+
+    if (Array.isArray(tools)) {
+        for (const tool of tools) {
+            const originalName = tool?.name;
+            if (!originalName) continue;
+            const aliasName = shortenKiroToolName(originalName);
+            originalToAlias.set(originalName, aliasName);
+            if (aliasName !== originalName) {
+                aliasToOriginal.set(aliasName, originalName);
+            }
+        }
+    }
+
+    return {
+        aliasToOriginal,
+        toKiroName: (name) => originalToAlias.get(name) || shortenKiroToolName(name),
+        fromKiroName: (name) => aliasToOriginal.get(name) || name
+    };
+}
+
+function restoreKiroToolCallNames(toolCalls, toolNameMaps) {
+    if (!toolCalls || !toolNameMaps?.fromKiroName) {
+        return toolCalls;
+    }
+
+    return toolCalls.map(toolCall => ({
+        ...toolCall,
+        function: {
+            ...toolCall.function,
+            name: toolNameMaps.fromKiroName(toolCall.function?.name)
+        }
+    }));
+}
+
+function getKiroRequestMinIntervalMs(config) {
+    const value = Number(config?.KIRO_REQUEST_MIN_INTERVAL_MS);
+    return Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
+}
+
+async function acquireKiroRequestSlot(config) {
+    const minIntervalMs = getKiroRequestMinIntervalMs(config);
+    if (minIntervalMs <= 0) {
+        return () => {};
+    }
+
+    let releaseCurrent;
+    const previous = kiroThrottleQueue.catch(() => {});
+    kiroThrottleQueue = previous.then(() => new Promise(resolve => {
+        releaseCurrent = resolve;
+    }));
+
+    await previous;
+
+    const elapsedMs = Date.now() - kiroLastRequestStartedAt;
+    const waitMs = Math.max(0, minIntervalMs - elapsedMs);
+    if (waitMs > 0) {
+        await new Promise(resolve => setTimeout(resolve, waitMs));
+    }
+    kiroLastRequestStartedAt = Date.now();
+
+    let released = false;
+    return () => {
+        if (released) return;
+        released = true;
+        releaseCurrent();
+    };
+}
+
 function normalizeKiroToolInput(input) {
     if (input === undefined || input === null) {
         return '';
@@ -1042,6 +1128,7 @@ async saveCredentialsToFile(filePath, newData) {
         processedMessages.push(...mergedMessages);
 
         const codewhispererModel = MODEL_MAPPING[model] || model;
+        const toolNameMaps = buildKiroToolNameMaps(tools);
         
         // 动态压缩 tools（保留全部工具，但过滤掉 web_search/websearch）
         let toolsContext = {};
@@ -1097,7 +1184,7 @@ async saveCredentialsToFile(filePath, newData) {
                         
                         return {
                             toolSpecification: {
-                                name: tool.name,
+                                name: toolNameMaps.toKiroName(tool.name),
                                 description: desc,
                                 inputSchema: {
                                     json: tool.input_schema || {}
@@ -1275,7 +1362,7 @@ async saveCredentialsToFile(filePath, newData) {
                         } else if (part.type === 'tool_use') {
                             toolUses.push({
                                 input: this._sanitizeToolInput(part.input),
-                                name: part.name,
+                                name: toolNameMaps.toKiroName(part.name),
                                 toolUseId: part.id
                             });
                         }
@@ -1326,7 +1413,7 @@ async saveCredentialsToFile(filePath, newData) {
                     } else if (part.type === 'tool_use') {
                         assistantResponseMessage.toolUses.push({
                             input: this._sanitizeToolInput(part.input),
-                            name: part.name,
+                            name: toolNameMaps.toKiroName(part.name),
                             toolUseId: part.id
                         });
                     }
@@ -1376,7 +1463,7 @@ async saveCredentialsToFile(filePath, newData) {
                     } else if (part.type === 'tool_use') {
                         currentToolUses.push({
                             input: this._sanitizeToolInput(part.input),
-                            name: part.name,
+                            name: toolNameMaps.toKiroName(part.name),
                             toolUseId: part.id
                         });
                     } else if (part.type === 'image') {
@@ -1460,6 +1547,11 @@ async saveCredentialsToFile(filePath, newData) {
             request.profileArn = this.profileArn;
         }
 
+        Object.defineProperty(request, '_kiroToolNameMaps', {
+            value: toolNameMaps,
+            enumerable: false
+        });
+
         // 监控钩子：内部请求转换
         if (this.config?._monitorRequestId) {
             try {
@@ -1481,7 +1573,7 @@ async saveCredentialsToFile(filePath, newData) {
         return request;
     }
 
-    parseEventStreamChunk(rawData) {
+    parseEventStreamChunk(rawData, toolNameMaps = null) {
         const rawStr = Buffer.isBuffer(rawData) ? rawData.toString('utf8') : String(rawData);
         let fullContent = '';
         const toolCalls = [];
@@ -1521,7 +1613,7 @@ async saveCredentialsToFile(filePath, newData) {
                                 id: eventData.toolUseId,
                                 type: "function",
                                 function: {
-                                    name: eventData.name,
+                                    name: toolNameMaps?.fromKiroName ? toolNameMaps.fromKiroName(eventData.name) : eventData.name,
                                     arguments: ""
                                 }
                             };
@@ -1576,7 +1668,7 @@ async saveCredentialsToFile(filePath, newData) {
             fullContent = fullContent.replace(/\s+/g, ' ').trim();
         }
 
-        const uniqueToolCalls = deduplicateToolCalls(toolCalls);
+        const uniqueToolCalls = restoreKiroToolCallNames(deduplicateToolCalls(toolCalls), toolNameMaps);
         return { content: fullContent || '', toolCalls: uniqueToolCalls };
     }
  
@@ -1621,7 +1713,14 @@ async saveCredentialsToFile(filePath, newData) {
                 headers
             };
             this._applySidecar(axiosConfig);
-            const response = await this.axiosInstance.request(axiosConfig);
+            const releaseThrottle = await acquireKiroRequestSlot(this.config);
+            let response;
+            try {
+                response = await this.axiosInstance.request(axiosConfig);
+            } finally {
+                releaseThrottle();
+            }
+            response._kiroToolNameMaps = requestData._kiroToolNameMaps;
             return response;
         } catch (error) {
             const status = error.response?.status;
@@ -1906,6 +2005,7 @@ async saveCredentialsToFile(filePath, newData) {
     }
 
     _processApiResponse(response) {
+        const toolNameMaps = response?._kiroToolNameMaps;
         const rawResponseText = Buffer.isBuffer(response.data) ? response.data.toString('utf8') : String(response.data);
         //logger.info(`[Kiro] Raw response length: ${rawResponseText.length}`);
         if (rawResponseText.includes("[Called")) {
@@ -1913,7 +2013,7 @@ async saveCredentialsToFile(filePath, newData) {
         }
 
         // 1. Parse structured events and bracket calls from parsed content
-        const parsedFromEvents = this.parseEventStreamChunk(rawResponseText);
+        const parsedFromEvents = this.parseEventStreamChunk(rawResponseText, toolNameMaps);
         let fullResponseText = parsedFromEvents.content;
         let allToolCalls = [...parsedFromEvents.toolCalls]; // clone
         //logger.info(`[Kiro] Found ${allToolCalls.length} tool calls from event stream parsing.`);
@@ -1922,7 +2022,7 @@ async saveCredentialsToFile(filePath, newData) {
         const rawBracketToolCalls = parseBracketToolCalls(rawResponseText);
         if (rawBracketToolCalls) {
             //logger.info(`[Kiro] Found ${rawBracketToolCalls.length} bracket tool calls in raw response.`);
-            allToolCalls.push(...rawBracketToolCalls);
+            allToolCalls.push(...restoreKiroToolCallNames(rawBracketToolCalls, toolNameMaps));
         }
 
         // 3. Deduplicate all collected tool calls
@@ -2141,6 +2241,7 @@ async saveCredentialsToFile(filePath, newData) {
         }
 
         const requestData = await this.buildCodewhispererRequest(messages, model, body.tools, body.system, body.thinking);
+        const toolNameMaps = requestData._kiroToolNameMaps;
 
         const token = this.accessToken;
         const headers = {
@@ -2151,6 +2252,7 @@ async saveCredentialsToFile(filePath, newData) {
         const requestUrl = model.startsWith('amazonq') ? this.amazonQUrl : this.baseUrl;
 
         let stream = null;
+        let releaseThrottle = () => {};
         try {
             const axiosConfig = {
                 method: 'post',
@@ -2160,6 +2262,7 @@ async saveCredentialsToFile(filePath, newData) {
                 responseType: 'stream'
             };
             this._applySidecar(axiosConfig);
+            releaseThrottle = await acquireKiroRequestSlot(this.config);
             const response = await this.axiosInstance.request(axiosConfig);
 
             stream = response.data;
@@ -2184,7 +2287,11 @@ async saveCredentialsToFile(filePath, newData) {
                         lastContentEvent = event.data;
                         yield { type: 'content', content: event.data };
                     } else if (event.type === 'toolUse') {
-                        yield { type: 'toolUse', toolUse: event.data };
+                        const toolUse = {
+                            ...event.data,
+                            name: toolNameMaps?.fromKiroName ? toolNameMaps.fromKiroName(event.data?.name) : event.data?.name
+                        };
+                        yield { type: 'toolUse', toolUse };
                     } else if (event.type === 'toolUseInput') {
                         yield { type: 'toolUseInput', input: event.data.input };
                     } else if (event.type === 'toolUseStop') {
@@ -2273,6 +2380,7 @@ async saveCredentialsToFile(filePath, newData) {
             logger.error(`[Kiro] Stream API call failed (Status: ${status}, Code: ${errorCode}):`,  error.message);
             throw error;
         } finally {
+            releaseThrottle();
             // 确保流被关闭，释放资源
             if (stream && typeof stream.destroy === 'function') {
                 stream.destroy();
