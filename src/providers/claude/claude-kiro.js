@@ -105,6 +105,10 @@ function getKiroRequestMinIntervalMs(config) {
     return Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
 }
 
+function shouldInjectKiroIdentityPrompt(config) {
+    return config?.KIRO_INJECT_IDENTITY_PROMPT === true || config?.KIRO_INJECT_IDENTITY_PROMPT === 'true';
+}
+
 async function acquireKiroRequestSlot(config) {
     const minIntervalMs = getKiroRequestMinIntervalMs(config);
     if (minIntervalMs <= 0) {
@@ -1056,11 +1060,8 @@ async saveCredentialsToFile(filePath, newData) {
                                </identity>`;
         
         let systemPrompt = this.getContentText(inSystemPrompt);
-        // 在 systemPrompt 前面添加内置前缀
-        if (systemPrompt) {
-            systemPrompt = `${builtInPrefix}\n\n${systemPrompt}`;
-        } else {
-            systemPrompt = `${builtInPrefix}`;
+        if (shouldInjectKiroIdentityPrompt(this.config)) {
+            systemPrompt = systemPrompt ? `${builtInPrefix}\n\n${systemPrompt}` : builtInPrefix;
         }
         
         const processedMessages = messages.map(message => ({
