@@ -120,4 +120,72 @@ describe('Kiro CodeWhisperer request conversion', () => {
             process.exit(0);
         `], { cwd: process.cwd(), stdio: 'pipe' });
     });
+
+    test('marks thinking-only stream responses as max_tokens and emits a minimal text block', async () => {
+        execFileSync(process.execPath, ['--input-type=module', '-e', `
+            import { KiroApiService } from './src/providers/claude/claude-kiro.js';
+
+            class TestKiroApiService extends KiroApiService {
+                constructor() {
+                    super();
+                    this.isInitialized = true;
+                }
+
+                async *streamApiReal() {
+                    yield { type: 'content', content: '<thinking>spent the whole budget</thinking>' };
+                    yield { type: 'contextUsage', contextUsagePercentage: 1 };
+                }
+            }
+
+            const service = new TestKiroApiService();
+            const events = [];
+            for await (const event of service.generateContentStream('claude-opus-4-7', {
+                thinking: { type: 'enabled', budget_tokens: 1024 },
+                messages: [{ role: 'user', content: 'hello' }]
+            })) {
+                events.push(event);
+            }
+
+            const textDelta = events.find(event =>
+                event.type === 'content_block_delta' &&
+                event.delta?.type === 'text_delta' &&
+                event.delta?.text === ' '
+            );
+            if (!textDelta) {
+                throw new Error('thinking-only stream did not emit the minimal text block');
+            }
+
+            const messageDelta = events.find(event => event.type === 'message_delta');
+            if (messageDelta?.delta?.stop_reason !== 'max_tokens') {
+                throw new Error('thinking-only stream did not use max_tokens stop_reason');
+            }
+
+            process.exit(0);
+        `], { cwd: process.cwd(), stdio: 'pipe' });
+    });
+
+    test('marks thinking-only non-stream responses as max_tokens', async () => {
+        execFileSync(process.execPath, ['--input-type=module', '-e', `
+            import { KiroApiService } from './src/providers/claude/claude-kiro.js';
+
+            const service = new KiroApiService();
+            const response = service.buildClaudeResponse(
+                [{ type: 'thinking', thinking: 'spent the whole budget' }],
+                false,
+                'assistant',
+                'claude-opus-4-7',
+                null,
+                10
+            );
+
+            if (response.stop_reason !== 'max_tokens') {
+                throw new Error('thinking-only non-stream response did not use max_tokens stop_reason');
+            }
+            if (!response.content.some(block => block.type === 'text' && block.text === ' ')) {
+                throw new Error('thinking-only non-stream response did not include a minimal text block');
+            }
+
+            process.exit(0);
+        `], { cwd: process.cwd(), stdio: 'pipe' });
+    });
 });

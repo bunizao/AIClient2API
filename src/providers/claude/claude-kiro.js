@@ -2440,6 +2440,8 @@ async saveCredentialsToFile(filePath, newData) {
             stoppedBlocks: new Set(),
             stripThinkingLeadingNewline: false,
             stripTextLeadingNewlinesAfterThinking: false,
+            hasVisibleText: false,
+            hasThinkingContent: false,
         };
 
         const ensureBlockStart = (blockType) => {
@@ -2475,6 +2477,9 @@ async saveCredentialsToFile(filePath, newData) {
 
         const createTextDeltaEvents = (text) => {
             if (!text) return [];
+            if (!isWhitespaceOnly(text)) {
+                streamState.hasVisibleText = true;
+            }
             const events = [];
             events.push(...ensureBlockStart('text'));
             events.push({
@@ -2486,6 +2491,9 @@ async saveCredentialsToFile(filePath, newData) {
         };
 
         const createThinkingDeltaEvents = (thinking) => {
+            if (thinking) {
+                streamState.hasThinkingContent = true;
+            }
             const events = [];
             events.push(...ensureBlockStart('thinking'));
             events.push({
@@ -2837,6 +2845,15 @@ async saveCredentialsToFile(filePath, newData) {
                 }
             }
 
+            const emittedOnlyThinking = thinkingRequested &&
+                streamState.hasThinkingContent &&
+                !streamState.hasVisibleText &&
+                toolCalls.length === 0;
+            if (emittedOnlyThinking) {
+                logger.warn('[Kiro Stream] Thinking-only response received; emitting minimal text block and max_tokens stop_reason');
+                yield* pushEvents(createTextDeltaEvents(' '));
+            }
+
             yield* pushEvents(stopBlock(streamState.textBlockIndex));
 
             // 检查文本内容中的 bracket 格式工具调用
@@ -2883,7 +2900,7 @@ async saveCredentialsToFile(filePath, newData) {
             // 4. 发送 message_delta 事件
             yield {
                 type: "message_delta",
-                delta: { stop_reason: toolCalls.length > 0 ? "tool_use" : "end_turn" },
+                delta: { stop_reason: toolCalls.length > 0 ? "tool_use" : (emittedOnlyThinking ? "max_tokens" : "end_turn") },
                 usage: {
                     input_tokens: inputTokens,
                     output_tokens: outputTokens,
@@ -3048,24 +3065,30 @@ async saveCredentialsToFile(filePath, newData) {
             let outputTokens = 0;
 
             // 1) Content blocks (text/thinking) first.
+            let hasTextContent = false;
+            let hasThinkingContent = false;
             if (Array.isArray(content)) {
                 for (const block of content) {
                     if (!block || typeof block !== 'object') continue;
                     if (block.type === 'text' && typeof block.text === 'string') {
                         contentArray.push({ type: 'text', text: block.text });
                         outputTokens += this.countTextTokens(block.text);
+                        if (!isWhitespaceOnly(block.text)) hasTextContent = true;
                     } else if (block.type === 'thinking' && typeof block.thinking === 'string') {
                         contentArray.push({ type: 'thinking', thinking: block.thinking });
                         outputTokens += this.countTextTokens(block.thinking);
+                        if (block.thinking) hasThinkingContent = true;
                     } else if (typeof block.text === 'string' && block.text) {
                         // Best-effort fallback for unknown blocks carrying plain text.
                         contentArray.push({ type: 'text', text: block.text });
                         outputTokens += this.countTextTokens(block.text);
+                        if (!isWhitespaceOnly(block.text)) hasTextContent = true;
                     }
                 }
             } else if (content) {
                 contentArray.push({ type: "text", text: content });
                 outputTokens += this.countTextTokens(content);
+                if (!isWhitespaceOnly(content)) hasTextContent = true;
             }
 
             // 2) Append tool_use blocks (if any).
@@ -3092,6 +3115,12 @@ async saveCredentialsToFile(filePath, newData) {
                     outputTokens += this.countTextTokens(tc.function.arguments);
                 }
                 stopReason = "tool_use"; // Set stop_reason to "tool_use" when toolCalls exist
+            }
+
+            if (hasThinkingContent && !hasTextContent && (!toolCalls || toolCalls.length === 0)) {
+                contentArray.push({ type: 'text', text: ' ' });
+                outputTokens += this.countTextTokens(' ');
+                stopReason = "max_tokens";
             }
 
             return {
