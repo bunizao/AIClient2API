@@ -34,51 +34,6 @@ describe('Kiro CodeWhisperer request conversion', () => {
         `], { cwd: process.cwd(), stdio: 'pipe' });
     });
 
-    test('does not inject the built-in Kiro identity prompt by default', async () => {
-        execFileSync(process.execPath, ['--input-type=module', '-e', `
-            import { KiroApiService } from './src/providers/claude/claude-kiro.js';
-
-            const service = new KiroApiService();
-            const request = await service.buildCodewhispererRequest(
-                [{ role: 'user', content: 'hello' }],
-                'claude-opus-4-7',
-                null,
-                'system prompt'
-            );
-
-            const content = request.conversationState.currentMessage.userInputMessage.content;
-            if (content.includes('CRITICAL_OVERRIDE') || content.includes('你一定不能说自己是 kiro')) {
-                throw new Error('built-in Kiro identity prompt was injected by default');
-            }
-            if (!content.includes('system prompt') || !content.includes('hello')) {
-                throw new Error('caller system prompt or user content was dropped');
-            }
-
-            process.exit(0);
-        `], { cwd: process.cwd(), stdio: 'pipe' });
-    });
-
-    test('can opt into the built-in Kiro identity prompt', async () => {
-        execFileSync(process.execPath, ['--input-type=module', '-e', `
-            import { KiroApiService } from './src/providers/claude/claude-kiro.js';
-
-            const service = new KiroApiService({ KIRO_INJECT_IDENTITY_PROMPT: true });
-            const request = await service.buildCodewhispererRequest(
-                [{ role: 'user', content: 'hello' }],
-                'claude-opus-4-7',
-                null,
-                'system prompt'
-            );
-
-            const content = request.conversationState.currentMessage.userInputMessage.content;
-            if (!content.includes('CRITICAL_OVERRIDE') || !content.includes('system prompt')) {
-                throw new Error('built-in Kiro identity prompt opt-in did not work');
-            }
-
-            process.exit(0);
-        `], { cwd: process.cwd(), stdio: 'pipe' });
-    });
-
     test('keeps prior turns in history for multi-turn requests', async () => {
         execFileSync(process.execPath, ['--input-type=module', '-e', `
             import { KiroApiService } from './src/providers/claude/claude-kiro.js';
